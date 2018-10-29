@@ -1,0 +1,388 @@
+# -*- coding: utf-8 -*-
+
+# FOGLAMP_BEGIN
+# See: http://foglamp.readthedocs.io/
+# FOGLAMP_END
+
+""" Module for playback async plugin """
+
+import asyncio
+import copy
+import csv
+import uuid
+import os
+import json
+import logging
+import datetime
+from threading import Timer
+from dateutil import parser
+
+from foglamp.common import logger
+from foglamp.plugins.common import utils
+from foglamp.services.south import exceptions
+from foglamp.services.south.ingest import Ingest
+
+
+__author__ = "Amarendra Kumar Sinha"
+__copyright__ = "Copyright (c) 2018 Dianomic Systems"
+__license__ = "Apache 2.0"
+__version__ = "${VERSION}"
+
+
+_DEFAULT_CONFIG = {
+    'plugin': {
+        'description': 'Test Sample',
+        'type': 'string',
+        'default': 'playback',
+        'readonly': 'true'
+    },
+    'assetName': {
+        'description': 'Name of Asset',
+        'type': 'string',
+        'default': 'sample',
+        'displayName': 'Asset Name',
+        'order': '1'
+    },
+    'csvFilename': {
+        'description': 'CSV File name',
+        'type': 'string',
+        'default': 'sinusoid.csv',
+        'displayName': 'CSV file name with extension',
+        'order': '2'
+    },
+    'headerRow': {
+        'description': 'If header row is preset as first row of CSV file',
+        'type': 'boolean',
+        'default': 'true',
+        'displayName': 'Header Row?',
+        'order': '3'
+    },
+    'fieldNames': {
+        'description': 'Comma separated list of column names, if headerRow is false',
+        'type': 'string',
+        'default': 'None',
+        'displayName': 'Header columns',
+        'order': '4'
+    },
+    'readingCols': {
+        'description': 'Cherry pick data columns with the same/new name e.g. {"readings": "readings", "ts": "timestamp"}',
+        'type': 'JSON',
+        'default': '{}',
+        'displayName': 'Cherry pick column with same/new name',
+        'order': '5'
+    },
+    'timestampFromFile': {
+        'description': 'Time Delta to be choosen from a column in the CSV',
+        'type': 'boolean',
+        'default': 'false',
+        'displayName': 'Time stamp from file?',
+        'order': '6'
+    },
+    'timestampCol': {
+        'description': 'Timestamp header column',
+        'type': 'string',
+        'default': 'ts',
+        'displayName': 'Timestamp column name',
+        'order': '7'
+    },
+    'timestampFormat': {
+        'description': 'Timestamp format in File',
+        'type': 'string',
+        'default': '%Y-%m-%d %H:%M:%S.%f',
+        'displayName': 'Time stamp format',
+        'order': '8'
+    },
+    'ingestMode': {
+        'description': 'Mode of data ingest - burst/realtime/batch',
+        'type': 'enumeration',
+        'default': 'burst',
+        'options': ['burst', 'realtime', 'batch'],
+        'displayName': 'Ingest mode?',
+        'order': '9'
+    },
+    'sampleRate': {
+        'description': 'No. of readings per sec',
+        'type': 'integer',
+        'default': '100',
+        'displayName': 'No. of samples per sec',
+        'minimum': '1',
+        'maximum': '1000000',
+        'order': '10'
+    },
+    'burstInterval': {
+        'description': 'Time interval between consecutive bursts in milliseconds',
+        'type': 'integer',
+        'default': '1000',
+        'displayName': 'Burst Interval (ms)',
+        'minimum': '1',
+        'order': '11'
+    },
+    'burstSize': {
+        'description': 'No. of data points in one burst',
+        'type': 'integer',
+        'default': '1',
+        'displayName': 'Data points per burst',
+        'minimum': '1',
+        'order': '12'
+    },
+    'repeatLoop': {
+        'description': 'Read CSV File in an endless loop',
+        'type': 'boolean',
+        'default': 'false',
+        'displayName': 'Read from file in a loop?',
+        'order': '13'
+    },
+}
+
+_FOGLAMP_ROOT = os.getenv("FOGLAMP_ROOT", default='/usr/local/foglamp')
+_FOGLAMP_DATA = os.path.expanduser(_FOGLAMP_ROOT + '/data')
+_LOGGER = logger.setup(__name__, level=logging.INFO)
+_task = None
+iter_sensor_data = None
+prv_readings_ts = None
+timestamp_format = None
+curr_ts = None
+timestamp_interval = None
+
+def plugin_info():
+    """ Returns information about the plugin.
+    Args:
+    Returns:
+        dict: plugin information
+    Raises:
+    """
+    return {
+        'name': 'Playback',
+        'version': '1.0',
+        'mode': 'async',
+        'type': 'south',
+        'interface': '1.0',
+        'config': _DEFAULT_CONFIG
+    }
+
+
+def plugin_init(config):
+    """ Initialise the plugin.
+    Args:
+        config: JSON configuration document for the South plugin configuration category
+    Returns:
+        data: JSON object to be used in future calls to the plugin
+    Raises:
+    """
+    data = copy.deepcopy(config)
+    try:
+        if not data['csvFilename']['value']:
+            raise RuntimeError("csv filename cannot be empty")
+        if int(data['sampleRate']['value']) < 1 or int(data['sampleRate']['value']) > 1000000:
+            raise RuntimeError("sampleRate should be in range 1-1000000")
+        if int(data['burstSize']['value']) < 1:
+            raise RuntimeError("burstSize should not be less than 1")
+        if int(data['burstInterval']['value']) < 1:
+            raise RuntimeError("burstInterval should not be less than 1")
+        if int(data['ingestMode']['value']) not in ['burst', 'realtime', 'batch']:
+            raise RuntimeError("ingestMode should be one of ('burst', 'realtime', 'batch')")
+    except KeyError:
+        raise
+    except RuntimeError:
+        raise
+    data['timestampFormat']['value'] = '%Y-%m-%d %H:%M:%S.%f'
+    return data
+
+
+def plugin_start(handle):
+    """ Extracts data from the playback and returns it in a JSON document as a Python dict.
+    Available for async mode only.
+
+    Args:
+        handle: handle returned by the plugin initialisation call
+    Returns:
+        a playback reading in a JSON document, as a Python dict
+    """
+    global _task, iter_sensor_data, prv_readings_ts, timestamp_format, timestamp_interval
+
+    async def save_data(sensor_data, time_stamp):
+        try:
+            data = {
+                'asset': handle['assetName']['value'],
+                'timestamp': time_stamp,
+                'key': str(uuid.uuid4()),
+                'readings': sensor_data
+            }
+            await Ingest.add_readings(asset='{}'.format(data['asset']),
+                                      timestamp=data['timestamp'], key=data['key'],
+                                      readings=data['readings'])
+        except (asyncio.CancelledError, RuntimeError):
+            pass
+        except RuntimeWarning as ex:
+            _LOGGER.exception("playback warning: {}".format(str(ex)))
+        except Exception as ex:
+            _LOGGER.exception("playback exception: {}".format(str(ex)))
+            raise exceptions.DataRetrievalError(ex)
+
+    def get_data(csv_file_name):
+        global timestamp_interval
+
+        # TODO: Improve this?
+        # This will handle timestamp for first row only as there is no prv row to compare timestamp with
+        if handle['timestampFromFile']['value'] == 'true':
+            ts_col = handle['timestampCol']['value']
+            if ts_col != 'None':
+                with open(csv_file_name, 'r' ) as f:
+                    field_names = handle['fieldNames']['value'].split(",") if handle['headerRow']['value'] == 'false' else None
+                    reader = csv.DictReader(f, fieldnames=field_names)
+                    line = next(reader)
+                    first_ts = parser.parse(line[ts_col])
+                    line = next(reader)
+                    second_ts = parser.parse(line[ts_col])
+                    timestamp_interval = (second_ts - first_ts).total_seconds()
+
+        with open(csv_file_name, 'r' ) as data_file:
+            # TODO: Audo detect header
+            # headr = data_file.readline()
+            # has_header = csv.Sniffer().has_header(headr)
+            # data_file.seek(0)  # Rewind.
+            # col_labels = None if has_header else field_names
+            # reader = csv.DictReader(data_file, fieldnames=col_labels)
+            field_names = handle['fieldNames']['value'].split(",") if handle['headerRow']['value'] == 'false' else None
+            reader = csv.DictReader(data_file, fieldnames=field_names)
+            for line in reader:
+                yield line
+
+    def get_time_stamp_diff(readings):
+        # The option to have the timestamp come from a column in the CSV file. The first timestamp should
+        # be treated as a base time for all the readings and the current time substituted for that time stamp.
+        # Successive readings should be sent with the same time delta as the times in the file. I.e. if the
+        # file contains a timestamp series 14:01:23, 14:01:53, 14:02:23,.. and the time we sent the first
+        # row of data is 18:15:45 then the second row should be sent at 18:16:15, preserving the same time
+        # difference between the rows.
+        global prv_readings_ts, timestamp_interval
+
+        ts_col = handle['timestampCol']['value']
+        ts_format = handle['timestampFormat']['value']
+        c = 0
+        if ts_col != 'None':
+            if ts_format == 'None':
+                readings_ts = parser.parse(readings[ts_col])
+            else:
+                readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
+            if prv_readings_ts is None:
+                c = timestamp_interval  # For first row only
+            else:
+                c = readings_ts - prv_readings_ts
+                c = c.total_seconds()
+            prv_readings_ts = readings_ts
+        return c
+
+    def run_task(loop):
+        global _task, iter_sensor_data, timestamp_interval
+
+        time_stamp = None
+        sensor_data = {}
+        data_count = 0
+        try:
+            time_stamp = utils.local_timestamp()
+            if handle['ingestMode']['value'] == 'burst':
+                # Support for burst of data. Allow a burst size to be defined in the configuration, default 1.
+                # If a size of greater than 1 is set then that number of input values should be sent as an
+                # array of value. E.g. with a burst size of 10, which data point in the reading will be an
+                # array of 10 elements.
+                burst_data_points = []
+                for i in range(int(handle['burstSize']['value'])):
+                    readings = next(iter_sensor_data)
+                    data_count += 1
+                    # If we need to cherry pick cols, and possibly with a different name
+                    if len(reading_cols) > 0:
+                        for k, v in reading_cols.items():
+                            if k in readings:
+                                burst_data_points.append(readings[k])
+                    else:
+                        burst_data_points.append(readings)
+                sensor_data.update({"readings": burst_data_points})
+                next_iteration_secs = period
+            else:
+                readings = next(iter_sensor_data)
+                data_count += 1
+                # If we need to cherry pick cols, and possibly with a different name
+                if len(reading_cols) > 0:
+                    for k, v in reading_cols.items():
+                        if k in readings:
+                            sensor_data.update({v: readings[k]})
+                else:
+                    sensor_data.update(readings)
+                if handle['timestampFromFile']['value'] == 'true':
+                    next_iteration_secs = get_time_stamp_diff(readings)
+                else:
+                    next_iteration_secs = period
+        except StopIteration as ex:
+            _LOGGER.exception("playback - EOF reached: {}".format(str(ex)))
+            # Rewind CSV file if it is to be read in an infinite loop
+            if handle['repeatLoop']['value'] == 'true':
+                iter_sensor_data = iter(get_data(csv_file_name))
+                sensor_data = next(iter_sensor_data)
+            elif data_count == 0:
+                return
+        else:
+            asyncio.ensure_future(save_data(sensor_data, time_stamp), loop=loop)
+            _task = Timer(next_iteration_secs, run_task, args=(loop, ))  # Chain next iteration
+            _task.start()
+
+    try:
+        if handle['ingestMode']['value'] == 'burst':
+            burst_interval = int(handle['burstInterval']['value'])
+            period = round(burst_interval / 1000.0, len(str(burst_interval)) + 1)
+        else:
+            recs = int(handle['sampleRate']['value'])
+            period = round(1.0 / recs, len(str(recs)) + 1)
+    except ZeroDivisionError:
+        _LOGGER.warning('sampleRate must be greater than 0, defaulting to 1')
+        period = 1.0
+
+    csv_file_name = "{}/{}".format(_FOGLAMP_DATA, handle['csvFilename']['value'])
+    iter_sensor_data = iter(get_data(csv_file_name))
+    reading_cols = json.loads(handle['readingCols']['value'])  # Cherry pick columns from readings and if desired, with
+
+    loop = asyncio.get_event_loop()
+    _task = Timer(period, run_task, args=(loop, ))  # Start first time
+    _task.start()
+
+def plugin_reconfigure(handle, new_config):
+    """ Reconfigures the plugin
+
+    Args:
+        handle: handle returned by the plugin initialisation call
+        new_config: JSON object representing the new configuration category for the category
+    Returns:
+        new_handle: new handle to be used in the future calls
+    """
+    _LOGGER.info("Old config for playback plugin {} \n new config {}".format(handle, new_config))
+    # Find diff between old config and new config
+    diff = utils.get_diff(handle, new_config)
+    # Plugin should re-initialize and restart if key configuration is changed
+    if 'assetName' in diff or 'csvFilename' in diff or 'headerRow' in diff or \
+        'fieldNames' in diff or 'readingCols' in diff or 'timestampFromFile' in diff or \
+        'timestampCol' in diff or 'timestampFormat' in diff or \
+        'sampleRate' in diff or 'ingestMode' in diff or 'burstSize' in diff or 'burstInterval' in diff or \
+        'repeatLoop' in diff:
+        plugin_shutdown(handle)
+        new_handle = plugin_init(new_config)
+        new_handle['restart'] = 'yes'
+        _LOGGER.info("Restarting playback plugin due to change in configuration key [{}]".format(', '.join(diff)))
+    else:
+        new_handle = copy.deepcopy(new_config)
+        new_handle['restart'] = 'no'
+    return new_handle
+
+
+def plugin_shutdown(handle):
+    """ Shutdowns the plugin doing required cleanup, to be called prior to the South plugin service being shut down.
+
+    Args:
+        handle: handle returned by the plugin initialisation call
+    Returns:
+        plugin shutdown
+    """
+    global _task
+    if _task is not None:
+        _task.cancel()
+        _task = None
+    _LOGGER.info('playback plugin shut down.')
