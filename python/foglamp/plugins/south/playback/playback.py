@@ -14,8 +14,12 @@ import os
 import json
 import logging
 import datetime
-from threading import Timer
+import time
+from threading import Event
 from dateutil import parser
+
+from queue import Queue
+from threading import Thread, Condition
 
 from foglamp.common import logger
 from foglamp.plugins.common import utils
@@ -137,12 +141,14 @@ _DEFAULT_CONFIG = {
 _FOGLAMP_ROOT = os.getenv("FOGLAMP_ROOT", default='/usr/local/foglamp')
 _FOGLAMP_DATA = os.path.expanduser(_FOGLAMP_ROOT + '/data')
 _LOGGER = logger.setup(__name__, level=logging.INFO)
-_task = None
-iter_sensor_data = None
-prv_readings_ts = None
-timestamp_format = None
-curr_ts = None
-timestamp_interval = None
+producer = None
+consumer = None
+bucket = None
+condition = None
+BUCKET_SIZE = 100
+wait_event = Event()
+wait_event.clear()
+
 
 def plugin_info():
     """ Returns information about the plugin.
@@ -198,152 +204,17 @@ def plugin_start(handle):
     Returns:
         a playback reading in a JSON document, as a Python dict
     """
-    global _task, iter_sensor_data, prv_readings_ts, timestamp_format, timestamp_interval
-
-    async def save_data(sensor_data, time_stamp):
-        try:
-            data = {
-                'asset': handle['assetName']['value'],
-                'timestamp': time_stamp,
-                'key': str(uuid.uuid4()),
-                'readings': sensor_data
-            }
-            await Ingest.add_readings(asset='{}'.format(data['asset']),
-                                      timestamp=data['timestamp'], key=data['key'],
-                                      readings=data['readings'])
-        except (asyncio.CancelledError, RuntimeError):
-            pass
-        except RuntimeWarning as ex:
-            _LOGGER.exception("playback warning: {}".format(str(ex)))
-        except Exception as ex:
-            _LOGGER.exception("playback exception: {}".format(str(ex)))
-            raise exceptions.DataRetrievalError(ex)
-
-    def get_data(csv_file_name):
-        global timestamp_interval
-
-        # TODO: Improve this?
-        # This will handle timestamp for first row only as there is no prv row to compare timestamp with
-        if handle['timestampFromFile']['value'] == 'true':
-            ts_col = handle['timestampCol']['value']
-            if ts_col != 'None':
-                with open(csv_file_name, 'r' ) as f:
-                    field_names = handle['fieldNames']['value'].split(",") if handle['headerRow']['value'] == 'false' else None
-                    reader = csv.DictReader(f, fieldnames=field_names)
-                    line = next(reader)
-                    first_ts = parser.parse(line[ts_col])
-                    line = next(reader)
-                    second_ts = parser.parse(line[ts_col])
-                    timestamp_interval = (second_ts - first_ts).total_seconds()
-
-        with open(csv_file_name, 'r' ) as data_file:
-            # TODO: Audo detect header
-            # headr = data_file.readline()
-            # has_header = csv.Sniffer().has_header(headr)
-            # data_file.seek(0)  # Rewind.
-            # col_labels = None if has_header else field_names
-            # reader = csv.DictReader(data_file, fieldnames=col_labels)
-            field_names = handle['fieldNames']['value'].split(",") if handle['headerRow']['value'] == 'false' else None
-            reader = csv.DictReader(data_file, fieldnames=field_names)
-            for line in reader:
-                yield line
-
-    def get_time_stamp_diff(readings):
-        # The option to have the timestamp come from a column in the CSV file. The first timestamp should
-        # be treated as a base time for all the readings and the current time substituted for that time stamp.
-        # Successive readings should be sent with the same time delta as the times in the file. I.e. if the
-        # file contains a timestamp series 14:01:23, 14:01:53, 14:02:23,.. and the time we sent the first
-        # row of data is 18:15:45 then the second row should be sent at 18:16:15, preserving the same time
-        # difference between the rows.
-        global prv_readings_ts, timestamp_interval
-
-        ts_col = handle['timestampCol']['value']
-        ts_format = handle['timestampFormat']['value']
-        c = 0
-        if ts_col != 'None':
-            if ts_format == 'None':
-                readings_ts = parser.parse(readings[ts_col])
-            else:
-                readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
-            if prv_readings_ts is None:
-                c = timestamp_interval  # For first row only
-            else:
-                c = readings_ts - prv_readings_ts
-                c = c.total_seconds()
-            prv_readings_ts = readings_ts
-        return c
-
-    def run_task(loop):
-        global _task, iter_sensor_data, timestamp_interval
-
-        time_stamp = None
-        sensor_data = {}
-        data_count = 0
-        try:
-            time_stamp = utils.local_timestamp()
-            if handle['ingestMode']['value'] == 'burst':
-                # Support for burst of data. Allow a burst size to be defined in the configuration, default 1.
-                # If a size of greater than 1 is set then that number of input values should be sent as an
-                # array of value. E.g. with a burst size of 10, which data point in the reading will be an
-                # array of 10 elements.
-                burst_data_points = []
-                for i in range(int(handle['burstSize']['value'])):
-                    readings = next(iter_sensor_data)
-                    data_count += 1
-                    # If we need to cherry pick cols, and possibly with a different name
-                    if len(reading_cols) > 0:
-                        for k, v in reading_cols.items():
-                            if k in readings:
-                                burst_data_points.append(readings[k])
-                    else:
-                        burst_data_points.append(readings)
-                sensor_data.update({"readings": burst_data_points})
-                next_iteration_secs = period
-            else:
-                readings = next(iter_sensor_data)
-                data_count += 1
-                # If we need to cherry pick cols, and possibly with a different name
-                if len(reading_cols) > 0:
-                    for k, v in reading_cols.items():
-                        if k in readings:
-                            sensor_data.update({v: readings[k]})
-                else:
-                    sensor_data.update(readings)
-                if handle['timestampFromFile']['value'] == 'true':
-                    next_iteration_secs = get_time_stamp_diff(readings)
-                else:
-                    next_iteration_secs = period
-        except StopIteration as ex:
-            _LOGGER.exception("playback - EOF reached: {}".format(str(ex)))
-            # Rewind CSV file if it is to be read in an infinite loop
-            if handle['repeatLoop']['value'] == 'true':
-                iter_sensor_data = iter(get_data(csv_file_name))
-                sensor_data = next(iter_sensor_data)
-            elif data_count == 0:
-                return
-        else:
-            asyncio.ensure_future(save_data(sensor_data, time_stamp), loop=loop)
-            _task = Timer(next_iteration_secs, run_task, args=(loop, ))  # Chain next iteration
-            _task.start()
-
-    try:
-        if handle['ingestMode']['value'] == 'burst':
-            burst_interval = int(handle['burstInterval']['value'])
-            period = round(burst_interval / 1000.0, len(str(burst_interval)) + 1)
-        else:
-            recs = int(handle['sampleRate']['value'])
-            period = round(1.0 / recs, len(str(recs)) + 1)
-    except ZeroDivisionError:
-        _LOGGER.warning('sampleRate must be greater than 0, defaulting to 1')
-        period = 1.0
-
-    csv_file_name = "{}/{}".format(_FOGLAMP_DATA, handle['csvFilename']['value'])
-    iter_sensor_data = iter(get_data(csv_file_name))
-    reading_cols = json.loads(handle['readingCols']['value'])  # Cherry pick columns from readings and if desired, with
+    global producer, consumer, bucket, condition
 
     loop = asyncio.get_event_loop()
-    _task = Timer(period, run_task, args=(loop, ))  # Start first time
-    _task.start()
+    condition = Condition()
+    bucket = Queue(BUCKET_SIZE)
+    producer = Producer(bucket, condition, handle, loop=loop)
+    consumer = Consumer(bucket, condition, handle, loop=loop)
+
+    producer.start()
+    consumer.start()
+    bucket.join()
 
 def plugin_reconfigure(handle, new_config):
     """ Reconfigures the plugin
@@ -381,8 +252,187 @@ def plugin_shutdown(handle):
     Returns:
         plugin shutdown
     """
-    global _task
-    if _task is not None:
-        _task.cancel()
-        _task = None
+    global producer, consumer
+
+    if producer is not None:
+        producer.cancel()
+        producer = None
+    if consumer is not None:
+        consumer.cancel()
+        consumer = None
     _LOGGER.info('playback plugin shut down.')
+
+
+class Producer(Thread):
+    def __init__(self, queue, condition, handle, loop=None):
+        super(Producer, self).__init__()
+        self.queue = queue
+        self.condition = condition
+        self.handle = handle
+        self.loop = loop
+
+        try:
+            if self.handle['ingestMode']['value'] == 'burst':
+                burst_interval = int(self.handle['burstInterval']['value'])
+                self.period = round(burst_interval / 1000.0, len(str(burst_interval)) + 1)
+            else:
+                recs = int(self.handle['sampleRate']['value'])
+                self.period = round(1.0 / recs, len(str(recs)) + 1)
+        except ZeroDivisionError:
+            _LOGGER.warning('sampleRate must be greater than 0, defaulting to 1')
+            self.period = 1.0
+
+        self.csv_file_name = "{}/{}".format(_FOGLAMP_DATA, self.handle['csvFilename']['value'])
+        self.iter_sensor_data = iter(self.get_data())
+
+        # Cherry pick columns from readings and if desired, with
+        self.reading_cols = json.loads(self.handle['readingCols']['value'])
+
+        self.prv_readings_ts = None
+        self.timestamp_interval = None
+
+    def get_data(self):
+        # TODO: Improve this?
+        # This will handle timestamp for first row only as there is no prv row to compare timestamp with
+        if self.handle['timestampFromFile']['value'] == 'true':
+            ts_col = self.handle['timestampCol']['value']
+            if ts_col != 'None':
+                with open(self.csv_file_name, 'r' ) as f:
+                    field_names = self.handle['fieldNames']['value'].split(",") if self.handle['headerRow']['value'] == 'false' else None
+                    reader = csv.DictReader(f, fieldnames=field_names)
+                    line = next(reader)
+                    first_ts = parser.parse(line[ts_col])
+                    line = next(reader)
+                    second_ts = parser.parse(line[ts_col])
+                    self.timestamp_interval = (second_ts - first_ts).total_seconds()
+
+        with open(self.csv_file_name, 'r' ) as data_file:
+            # TODO: Audo detect header
+            # headr = data_file.readline()
+            # has_header = csv.Sniffer().has_header(headr)
+            # data_file.seek(0)  # Rewind.
+            # col_labels = None if has_header else field_names
+            # reader = csv.DictReader(data_file, fieldnames=col_labels)
+            field_names = self.handle['fieldNames']['value'].split(",") if self.handle['headerRow']['value'] == 'false' else None
+            reader = csv.DictReader(data_file, fieldnames=field_names)
+            for line in reader:
+                yield line
+
+    def get_time_stamp_diff(self, readings):
+        # The option to have the timestamp come from a column in the CSV file. The first timestamp should
+        # be treated as a base time for all the readings and the current time substituted for that time stamp.
+        # Successive readings should be sent with the same time delta as the times in the file. I.e. if the
+        # file contains a timestamp series 14:01:23, 14:01:53, 14:02:23,.. and the time we sent the first
+        # row of data is 18:15:45 then the second row should be sent at 18:16:15, preserving the same time
+        # difference between the rows.
+        ts_col = self.handle['timestampCol']['value']
+        ts_format = self.handle['timestampFormat']['value']
+        c = 0
+        if ts_col != 'None':
+            if ts_format == 'None':
+                readings_ts = parser.parse(readings[ts_col])
+            else:
+                readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
+            if self.prv_readings_ts is None:
+                c = self.timestamp_interval  # For first row only
+            else:
+                c = readings_ts - self.prv_readings_ts
+                c = c.total_seconds()
+            self.prv_readings_ts = readings_ts
+        return c
+
+    def run(self):
+        rec_count = 0
+        while True:
+            time_start = time.time()
+            time_stamp = None
+            sensor_data = {}
+            data_count = 0
+            try:
+                time_stamp = utils.local_timestamp()
+                if self.handle['ingestMode']['value'] == 'burst':
+                    # Support for burst of data. Allow a burst size to be defined in the configuration, default 1.
+                    # If a size of greater than 1 is set then that number of input values should be sent as an
+                    # array of value. E.g. with a burst size of 10, which data point in the reading will be an
+                    # array of 10 elements.
+                    burst_data_points = []
+                    for i in range(int(self.handle['burstSize']['value'])):
+                        readings = next(self.iter_sensor_data)
+                        data_count += 1
+                        # If we need to cherry pick cols, and possibly with a different name
+                        if len(self.reading_cols) > 0:
+                            for k, v in self.reading_cols.items():
+                                if k in readings:
+                                    burst_data_points.append(readings[k])
+                        else:
+                            burst_data_points.append(readings)
+                    sensor_data.update({"readings": burst_data_points})
+                    next_iteration_secs = self.period
+                else:
+                    readings = next(self.iter_sensor_data)
+                    data_count += 1
+                    # If we need to cherry pick cols, and possibly with a different name
+                    if len(self.reading_cols) > 0:
+                        for k, v in self.reading_cols.items():
+                            if k in readings:
+                                sensor_data.update({v: readings[k]})
+                    else:
+                        sensor_data.update(readings)
+                    if self.handle['timestampFromFile']['value'] == 'true':
+                        next_iteration_secs = self.get_time_stamp_diff(readings)
+                    else:
+                        next_iteration_secs = self.period
+            except StopIteration as ex:
+                _LOGGER.exception("playback - EOF reached: {}".format(str(ex)))
+                # Rewind CSV file if it is to be read in an infinite loop
+                if self.handle['repeatLoop']['value'] == 'true':
+                    self.iter_sensor_data = iter(self.get_data())
+                    sensor_data = next(self.iter_sensor_data)
+                elif data_count == 0:
+                    return
+
+            if not self.condition._is_owned():
+                self.condition.acquire()
+            value = {'data': sensor_data, 'ts': time_stamp}
+            self.queue.put(value)
+            if self.queue.full():
+                self.condition.notify()
+                self.condition.release()
+            wait_event.wait(timeout=next_iteration_secs - (time.time()-time_start))
+
+class Consumer(Thread):
+    def __init__(self, queue, condition, handle, loop=None):
+        super(Consumer, self).__init__()
+        self.queue = queue
+        self.condition = condition
+        self.handle = handle
+        self.loop = loop
+
+    def run(self):
+        asyncio.set_event_loop(loop=self.loop)
+        while True:
+            self.condition.acquire()
+            while self.queue.qsize() > 0:
+                data = self.queue.get()
+                asyncio.ensure_future(self.save_data(data['data'], data['ts']), loop=self.loop)
+            self.condition.notify()
+            self.condition.release()
+
+    async def save_data(self, sensor_data, time_stamp):
+        try:
+            data = {
+                'asset': self.handle['assetName']['value'],
+                'timestamp': time_stamp,
+                'key': str(uuid.uuid4()),
+                'readings': sensor_data
+            }
+            await Ingest.add_readings(asset='{}'.format(data['asset']),
+                                      timestamp=data['timestamp'], key=data['key'],
+                                      readings=data['readings'])
+        except (asyncio.CancelledError, RuntimeError):
+            pass
+        except RuntimeWarning as ex:
+            _LOGGER.exception("playback warning: {}".format(str(ex)))
+        except Exception as ex:
+            _LOGGER.exception("playback exception: {}".format(str(ex)))
+            raise exceptions.DataRetrievalError(ex)
