@@ -145,7 +145,7 @@ producer = None
 consumer = None
 bucket = None
 condition = None
-BUCKET_SIZE = 100
+BUCKET_SIZE = 1000
 wait_event = Event()
 wait_event.clear()
 
@@ -191,7 +191,6 @@ def plugin_init(config):
         raise
     except RuntimeError:
         raise
-    data['timestampFormat']['value'] = '%Y-%m-%d %H:%M:%S.%f'
     return data
 
 
@@ -209,12 +208,13 @@ def plugin_start(handle):
     loop = asyncio.get_event_loop()
     condition = Condition()
     bucket = Queue(BUCKET_SIZE)
-    producer = Producer(bucket, condition, handle, loop=loop)
-    consumer = Consumer(bucket, condition, handle, loop=loop)
+    producer = Producer(bucket, condition, handle, loop)
+    consumer = Consumer(bucket, condition, handle, loop)
 
     producer.start()
     consumer.start()
     bucket.join()
+
 
 def plugin_reconfigure(handle, new_config):
     """ Reconfigures the plugin
@@ -255,16 +255,18 @@ def plugin_shutdown(handle):
     global producer, consumer
 
     if producer is not None:
-        producer.cancel()
+        producer._tstate_lock = None
+        producer._stop()
         producer = None
     if consumer is not None:
-        consumer.cancel()
+        consumer._tstate_lock = None
+        consumer._stop()
         consumer = None
     _LOGGER.info('playback plugin shut down.')
 
 
 class Producer(Thread):
-    def __init__(self, queue, condition, handle, loop=None):
+    def __init__(self, queue, condition, handle, loop):
         super(Producer, self).__init__()
         self.queue = queue
         self.condition = condition
@@ -342,7 +344,6 @@ class Producer(Thread):
         return c
 
     def run(self):
-        rec_count = 0
         while True:
             time_start = time.time()
             time_stamp = None
@@ -387,8 +388,7 @@ class Producer(Thread):
                 # Rewind CSV file if it is to be read in an infinite loop
                 if self.handle['repeatLoop']['value'] == 'true':
                     self.iter_sensor_data = iter(self.get_data())
-                    sensor_data = next(self.iter_sensor_data)
-                elif data_count == 0:
+                if data_count == 0:
                     return
 
             if not self.condition._is_owned():
@@ -398,10 +398,12 @@ class Producer(Thread):
             if self.queue.full():
                 self.condition.notify()
                 self.condition.release()
+
             wait_event.wait(timeout=next_iteration_secs - (time.time()-time_start))
 
+
 class Consumer(Thread):
-    def __init__(self, queue, condition, handle, loop=None):
+    def __init__(self, queue, condition, handle, loop):
         super(Consumer, self).__init__()
         self.queue = queue
         self.condition = condition
