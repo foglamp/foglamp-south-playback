@@ -179,7 +179,7 @@ def plugin_init(config):
             raise RuntimeError("burstSize should not be less than 1")
         if int(data['burstInterval']['value']) < 1:
             raise RuntimeError("burstInterval should not be less than 1")
-        if int(data['ingestMode']['value']) not in ['burst', 'realtime', 'batch']:
+        if data['ingestMode']['value'] not in ['burst', 'realtime', 'batch']:
             raise RuntimeError("ingestMode should be one of ('burst', 'realtime', 'batch')")
     except KeyError:
         raise
