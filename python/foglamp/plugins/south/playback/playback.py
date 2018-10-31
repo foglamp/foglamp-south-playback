@@ -136,6 +136,16 @@ _DEFAULT_CONFIG = {
         'displayName': 'Read from file in a loop?',
         'order': '13'
     },
+    'bucketSize': {
+        'description': 'No. of items in the shared queue between Producer and Consumer. '
+                       'As a rule of thumb, burst mode bucket size should be much smaller (around 10) than '
+                       'realtime/batch mode bucket size (around 1000)',
+        'type': 'integer',
+        'default': '1000',
+        'minimum': '10',
+        'displayName': 'Queue size',
+        'order': '14'
+    },
 }
 
 _FOGLAMP_ROOT = os.getenv("FOGLAMP_ROOT", default='/usr/local/foglamp')
@@ -145,7 +155,7 @@ producer = None
 consumer = None
 bucket = None
 condition = None
-BUCKET_SIZE = 1000
+BUCKET_SIZE = 10
 wait_event = Event()
 wait_event.clear()
 
@@ -187,6 +197,8 @@ def plugin_init(config):
             raise RuntimeError("burstInterval should not be less than 1")
         if data['ingestMode']['value'] not in ['burst', 'realtime', 'batch']:
             raise RuntimeError("ingestMode should be one of ('burst', 'realtime', 'batch')")
+        if int(data['bucketSize']['value']) < 10:
+            raise RuntimeError("bucketSize should not be less than 10")
     except KeyError:
         raise
     except RuntimeError:
@@ -207,6 +219,7 @@ def plugin_start(handle):
 
     loop = asyncio.get_event_loop()
     condition = Condition()
+    BUCKET_SIZE = int(handle['bucketSize']['value'])
     bucket = Queue(BUCKET_SIZE)
     producer = Producer(bucket, condition, handle, loop)
     consumer = Consumer(bucket, condition, handle, loop)
@@ -233,7 +246,7 @@ def plugin_reconfigure(handle, new_config):
         'fieldNames' in diff or 'readingCols' in diff or 'timestampFromFile' in diff or \
         'timestampCol' in diff or 'timestampFormat' in diff or \
         'sampleRate' in diff or 'ingestMode' in diff or 'burstSize' in diff or 'burstInterval' in diff or \
-        'repeatLoop' in diff:
+        'repeatLoop' in diff or 'bucketSize' in diff:
         plugin_shutdown(handle)
         new_handle = plugin_init(new_config)
         new_handle['restart'] = 'yes'
@@ -364,10 +377,10 @@ class Producer(Thread):
                         if len(self.reading_cols) > 0:
                             for k, v in self.reading_cols.items():
                                 if k in readings:
-                                    burst_data_points.append(readings[k])
+                                    burst_data_points.append({v: readings[k]})
                         else:
                             burst_data_points.append(readings)
-                    sensor_data.update({"readings": burst_data_points})
+                    sensor_data.update({"data": burst_data_points})
                     next_iteration_secs = self.period
                 else:
                     readings = next(self.iter_sensor_data)
