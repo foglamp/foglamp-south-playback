@@ -97,10 +97,10 @@ _DEFAULT_CONFIG = {
         'order': '8'
     },
     'ingestMode': {
-        'description': 'Mode of data ingest - burst/realtime/batch',
+        'description': 'Mode of data ingest - burst/batch',
         'type': 'enumeration',
         'default': 'burst',
-        'options': ['burst', 'realtime', 'batch'],
+        'options': ['burst', 'batch'],
         'displayName': 'Ingest mode?',
         'order': '9'
     },
@@ -108,7 +108,7 @@ _DEFAULT_CONFIG = {
         'description': 'No. of readings per sec',
         'type': 'integer',
         'default': '100',
-        'displayName': 'No. of samples per sec',
+        'displayName': 'Sample Rate',
         'minimum': '1',
         'maximum': '1000000',
         'order': '10'
@@ -125,7 +125,7 @@ _DEFAULT_CONFIG = {
         'description': 'No. of data points in one burst',
         'type': 'integer',
         'default': '1',
-        'displayName': 'Data points per burst',
+        'displayName': 'Burst size',
         'minimum': '1',
         'order': '12'
     },
@@ -136,16 +136,6 @@ _DEFAULT_CONFIG = {
         'displayName': 'Read from file in a loop?',
         'order': '13'
     },
-    'bucketSize': {
-        'description': 'No. of items in the shared queue between Producer and Consumer. '
-                       'As a rule of thumb, burst mode bucket size should be much smaller (around 10) than '
-                       'realtime/batch mode bucket size (around 1000)',
-        'type': 'integer',
-        'default': '1000',
-        'minimum': '10',
-        'displayName': 'Queue size',
-        'order': '14'
-    },
 }
 
 _FOGLAMP_ROOT = os.getenv("FOGLAMP_ROOT", default='/usr/local/foglamp')
@@ -155,7 +145,7 @@ producer = None
 consumer = None
 bucket = None
 condition = None
-BUCKET_SIZE = 10
+BUCKET_SIZE = 1000
 wait_event = Event()
 wait_event.clear()
 
@@ -197,8 +187,6 @@ def plugin_init(config):
             raise RuntimeError("burstInterval should not be less than 1")
         if data['ingestMode']['value'] not in ['burst', 'realtime', 'batch']:
             raise RuntimeError("ingestMode should be one of ('burst', 'realtime', 'batch')")
-        if int(data['bucketSize']['value']) < 10:
-            raise RuntimeError("bucketSize should not be less than 10")
     except KeyError:
         raise
     except RuntimeError:
@@ -215,11 +203,15 @@ def plugin_start(handle):
     Returns:
         a playback reading in a JSON document, as a Python dict
     """
-    global producer, consumer, bucket, condition
+    global producer, consumer, bucket, condition, BUCKET_SIZE
+
+    if handle['ingestMode']['value'] == 'burst':
+        BUCKET_SIZE = 10
+    else:
+        BUCKET_SIZE = max(int(handle['sampleRate']['value']), 1000)
 
     loop = asyncio.get_event_loop()
     condition = Condition()
-    BUCKET_SIZE = int(handle['bucketSize']['value'])
     bucket = Queue(BUCKET_SIZE)
     producer = Producer(bucket, condition, handle, loop)
     consumer = Consumer(bucket, condition, handle, loop)
@@ -246,7 +238,7 @@ def plugin_reconfigure(handle, new_config):
         'fieldNames' in diff or 'readingCols' in diff or 'timestampFromFile' in diff or \
         'timestampCol' in diff or 'timestampFormat' in diff or \
         'sampleRate' in diff or 'ingestMode' in diff or 'burstSize' in diff or 'burstInterval' in diff or \
-        'repeatLoop' in diff or 'bucketSize' in diff:
+        'repeatLoop' in diff:
         plugin_shutdown(handle)
         new_handle = plugin_init(new_config)
         new_handle['restart'] = 'yes'
@@ -357,11 +349,11 @@ class Producer(Thread):
         return c
 
     def run(self):
+        eof_reached = False
         while True:
             time_start = time.time()
             time_stamp = None
             sensor_data = {}
-            data_count = 0
             try:
                 time_stamp = utils.local_timestamp()
                 if self.handle['ingestMode']['value'] == 'burst':
@@ -372,7 +364,6 @@ class Producer(Thread):
                     burst_data_points = []
                     for i in range(int(self.handle['burstSize']['value'])):
                         readings = next(self.iter_sensor_data)
-                        data_count += 1
                         # If we need to cherry pick cols, and possibly with a different name
                         if len(self.reading_cols) > 0:
                             for k, v in self.reading_cols.items():
@@ -384,7 +375,6 @@ class Producer(Thread):
                     next_iteration_secs = self.period
                 else:
                     readings = next(self.iter_sensor_data)
-                    data_count += 1
                     # If we need to cherry pick cols, and possibly with a different name
                     if len(self.reading_cols) > 0:
                         for k, v in self.reading_cols.items():
@@ -397,21 +387,25 @@ class Producer(Thread):
                     else:
                         next_iteration_secs = self.period
             except StopIteration as ex:
-                _LOGGER.exception("playback - EOF reached: {}".format(str(ex)))
-                # Rewind CSV file if it is to be read in an infinite loop
-                if self.handle['repeatLoop']['value'] == 'true':
-                    self.iter_sensor_data = iter(self.get_data())
-                if data_count == 0:
-                    return
+                _LOGGER.warning("playback - EOF reached: {}".format(str(ex)))
+                eof_reached = True
 
             if not self.condition._is_owned():
                 self.condition.acquire()
-            value = {'data': sensor_data, 'ts': time_stamp}
-            self.queue.put(value)
-            if self.queue.full():
+            if not eof_reached:
+                value = {'data': sensor_data, 'ts': time_stamp}
+                self.queue.put(value)
+            if self.queue.full() or eof_reached:
                 self.condition.notify()
                 self.condition.release()
 
+            if eof_reached:
+                # Rewind CSV file if it is to be read in an infinite loop
+                if self.handle['repeatLoop']['value'] == 'true':
+                    self.iter_sensor_data = iter(self.get_data())
+                    eof_reached = False
+                else:
+                    return
             wait_event.wait(timeout=next_iteration_secs - (time.time()-time_start))
 
 
