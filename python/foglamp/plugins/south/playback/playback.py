@@ -349,8 +349,6 @@ class Producer(Thread):
         c = 0
         readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
         if self.prv_readings_ts is not None:
-        #     c = self.timestamp_interval  # For first row only
-        # else:
             c = readings_ts - self.prv_readings_ts
             c = c.total_seconds()
         self.prv_readings_ts = readings_ts
