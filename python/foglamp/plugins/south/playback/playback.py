@@ -174,19 +174,28 @@ def plugin_init(config):
     """
     data = copy.deepcopy(config)
     try:
+        errors = False
         csv_file_name = "{}/{}".format(_FOGLAMP_DATA, data['csvFilename']['value'])
         if not os.path.isfile(csv_file_name):
-            raise RuntimeError('csv filename "{}" not found'.format(csv_file_name))
+            _LOGGER.exception('csv filename "{}" not found'.format(csv_file_name))
+            errors = True
         if not data['csvFilename']['value']:
-            raise RuntimeError("csv filename cannot be empty")
+            _LOGGER.exception("csv filename cannot be empty")
+            errors = True
         if int(data['sampleRate']['value']) < 1 or int(data['sampleRate']['value']) > 1000000:
-            raise RuntimeError("sampleRate should be in range 1-1000000")
+            _LOGGER.exception("sampleRate should be in range 1-1000000")
+            errors = True
         if int(data['burstSize']['value']) < 1:
-            raise RuntimeError("burstSize should not be less than 1")
+            _LOGGER.exception("burstSize should not be less than 1")
+            errors = True
         if int(data['burstInterval']['value']) < 1:
-            raise RuntimeError("burstInterval should not be less than 1")
+            _LOGGER.exception("burstInterval should not be less than 1")
+            errors = True
         if data['ingestMode']['value'] not in ['burst', 'realtime', 'batch']:
-            raise RuntimeError("ingestMode should be one of ('burst', 'realtime', 'batch')")
+            _LOGGER.exception("ingestMode should be one of ('burst', 'realtime', 'batch')")
+            errors = True
+        if errors:
+            raise RuntimeError
     except KeyError:
         raise
     except RuntimeError:
@@ -344,14 +353,17 @@ class Producer(Thread):
         # file contains a timestamp series 14:01:23, 14:01:53, 14:02:23,.. and the time we sent the first
         # row of data is 18:15:45 then the second row should be sent at 18:16:15, preserving the same time
         # difference between the rows.
-        ts_col = self.handle['timestampCol']['value']
-        ts_format = self.handle['timestampFormat']['value']
         c = 0
-        readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
-        if self.prv_readings_ts is not None:
-            c = readings_ts - self.prv_readings_ts
-            c = c.total_seconds()
-        self.prv_readings_ts = readings_ts
+        try:
+            ts_col = self.handle['timestampCol']['value']
+            ts_format = self.handle['timestampFormat']['value']
+            readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
+            if self.prv_readings_ts is not None:
+                c = readings_ts - self.prv_readings_ts
+                c = c.total_seconds()
+            self.prv_readings_ts = readings_ts
+        except Exception as ex:
+            raise RuntimeError(str(ex))
         return c
 
     def run(self):
