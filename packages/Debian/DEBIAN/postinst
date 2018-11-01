@@ -27,14 +27,9 @@
 
 set -e
 
-install_deps () {
-    pip3 install -Ir /usr/local/foglamp/python/requirements-playback.txt --no-cache-dir
-}
-
 set_files_ownership () {
     chown -R root:root /usr/local/foglamp/python/foglamp/plugins/south/playback
 }
 
-install_deps
 set_files_ownership
 echo "playback plugin is installed."
