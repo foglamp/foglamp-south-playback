@@ -373,9 +373,11 @@ class Producer(Thread):
                         readings = next(self.iter_sensor_data)
                         # If we need to cherry pick cols, and possibly with a different name
                         if len(self.reading_cols) > 0:
+                            new_dict = {}
                             for k, v in self.reading_cols.items():
                                 if k in readings:
-                                    burst_data_points.append({v: readings[k]})
+                                    new_dict.update({v: readings[k]})
+                            burst_data_points.append(new_dict)
                         else:
                             burst_data_points.append(readings)
                     sensor_data.update({"data": burst_data_points})
@@ -396,6 +398,9 @@ class Producer(Thread):
             except StopIteration as ex:
                 _LOGGER.warning("playback - EOF reached: {}".format(str(ex)))
                 eof_reached = True
+                if self.handle['ingestMode']['value'] == 'burst':
+                    if len(burst_data_points) > 0:
+                        sensor_data.update({"data": burst_data_points})
             except Exception as ex:
                 _LOGGER.warning("playback producer exception: {}".format(str(ex)))
 
@@ -404,7 +409,7 @@ class Producer(Thread):
 
             if not self.condition._is_owned():
                 self.condition.acquire()
-            if not eof_reached:
+            if len(sensor_data) > 0 :
                 value = {'data': sensor_data, 'ts': time_stamp}
                 self.queue.put(value)
             if self.queue.full() or eof_reached:
