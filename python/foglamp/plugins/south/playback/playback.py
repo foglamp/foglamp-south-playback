@@ -143,9 +143,8 @@ producer = None
 consumer = None
 bucket = None
 condition = None
-BUCKET_SIZE = 1000
+BUCKET_SIZE = 1
 wait_event = Event()
-wait_event.clear()
 
 
 def plugin_info():
@@ -204,18 +203,18 @@ def plugin_start(handle):
     Returns:
         a playback reading in a JSON document, as a Python dict
     """
-    global producer, consumer, bucket, condition, BUCKET_SIZE
+    global producer, consumer, bucket, condition, BUCKET_SIZE, wait_event
 
-    if handle['ingestMode']['value'] == 'burst':
-        BUCKET_SIZE = 10
-    else:
-        BUCKET_SIZE = max(int(handle['sampleRate']['value']), 1000)
+    if handle['timestampFromFile']['value'] == 'false':
+        BUCKET_SIZE = int(handle['sampleRate']['value'])
 
     loop = asyncio.get_event_loop()
     condition = Condition()
     bucket = Queue(BUCKET_SIZE)
     producer = Producer(bucket, condition, handle, loop)
     consumer = Consumer(bucket, condition, handle, loop)
+
+    wait_event.clear()
 
     producer.start()
     consumer.start()
@@ -258,8 +257,9 @@ def plugin_shutdown(handle):
     Returns:
         plugin shutdown
     """
-    global producer, consumer
+    global producer, consumer, wait_event
 
+    wait_event.set()
     if producer is not None:
         producer._tstate_lock = None
         producer._stop()
@@ -317,21 +317,17 @@ class Producer(Thread):
         #     headr = headr.strip().replace('\n','').replace('\r','').replace(' ','')
         #     field_names = self.handle['fieldNames']['value'].split(",") if has_header is None else headr.split(',')
 
-        # TODO: Improve this?
-        # This will handle timestamp for first row only as there is no prv row to compare timestamp with
+        # Exclude timestampCol from reading_cols
         if self.handle['timestampFromFile']['value'] == 'true':
             ts_col = self.handle['timestampCol']['value']
-            ts_format = self.handle['timestampFormat']['value']
-            with open(self.csv_file_name, 'r' ) as f:
-                reader = csv.DictReader(f, fieldnames=field_names)
-                # Skip Header
-                if has_header:
-                    next(reader)
-                line = next(reader)
-                first_ts = datetime.datetime.strptime(line[ts_col], ts_format)
-                line = next(reader)
-                second_ts = datetime.datetime.strptime(line[ts_col], ts_format)
-                self.timestamp_interval = (second_ts - first_ts).total_seconds()
+            new_reading_cols = self.reading_cols.copy()
+            if len(self.reading_cols) > 0:
+                for k, v in self.reading_cols.items():
+                    if ts_col != k: new_reading_cols.update({k: v})
+            else:
+                for i in field_names:
+                    if ts_col != i: new_reading_cols.update({i:i})
+            self.reading_cols = new_reading_cols.copy()
 
         with open(self.csv_file_name, 'r' ) as data_file:
             reader = csv.DictReader(data_file, fieldnames=field_names)
@@ -352,9 +348,9 @@ class Producer(Thread):
         ts_format = self.handle['timestampFormat']['value']
         c = 0
         readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
-        if self.prv_readings_ts is None:
-            c = self.timestamp_interval  # For first row only
-        else:
+        if self.prv_readings_ts is not None:
+        #     c = self.timestamp_interval  # For first row only
+        # else:
             c = readings_ts - self.prv_readings_ts
             c = c.total_seconds()
         self.prv_readings_ts = readings_ts
@@ -367,7 +363,6 @@ class Producer(Thread):
             time_stamp = None
             sensor_data = {}
             try:
-                time_stamp = utils.local_timestamp()
                 if self.handle['ingestMode']['value'] == 'burst':
                     # Support for burst of data. Allow a burst size to be defined in the configuration, default 1.
                     # If a size of greater than 1 is set then that number of input values should be sent as an
@@ -404,6 +399,9 @@ class Producer(Thread):
             except Exception as ex:
                 _LOGGER.warning("playback producer exception: {}".format(str(ex)))
 
+            wait_event.wait(timeout=next_iteration_secs - (time.time()-time_start))
+            time_stamp = utils.local_timestamp()
+
             if not self.condition._is_owned():
                 self.condition.acquire()
             if not eof_reached:
@@ -420,7 +418,6 @@ class Producer(Thread):
                     eof_reached = False
                 else:
                     return
-            wait_event.wait(timeout=next_iteration_secs - (time.time()-time_start))
 
 
 class Consumer(Thread):
