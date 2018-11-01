@@ -16,8 +16,6 @@ import logging
 import datetime
 import time
 from threading import Event
-from dateutil import parser
-
 from queue import Queue
 from threading import Thread, Condition
 
@@ -58,11 +56,11 @@ _DEFAULT_CONFIG = {
         'description': 'If header row is preset as first row of CSV file',
         'type': 'boolean',
         'default': 'true',
-        'displayName': 'Header Row?',
+        'displayName': 'Header Row',
         'order': '3'
     },
     'fieldNames': {
-        'description': 'Comma separated list of column names, if headerRow is false',
+        'description': 'Comma separated list of column names, mandatory if headerRow is false',
         'type': 'string',
         'default': 'None',
         'displayName': 'Header columns',
@@ -83,17 +81,17 @@ _DEFAULT_CONFIG = {
         'order': '6'
     },
     'timestampCol': {
-        'description': 'Timestamp header column',
+        'description': 'Timestamp header column, mandatory if timestampFromFile is true',
         'type': 'string',
         'default': 'ts',
         'displayName': 'Timestamp column name',
         'order': '7'
     },
     'timestampFormat': {
-        'description': 'Timestamp format in File',
+        'description': 'Timestamp format in File, mandatory if timestampFromFile is true',
         'type': 'string',
         'default': '%Y-%m-%d %H:%M:%S.%f',
-        'displayName': 'Time stamp format',
+        'displayName': 'Timestamp format',
         'order': '8'
     },
     'ingestMode': {
@@ -101,7 +99,7 @@ _DEFAULT_CONFIG = {
         'type': 'enumeration',
         'default': 'burst',
         'options': ['burst', 'batch'],
-        'displayName': 'Ingest mode?',
+        'displayName': 'Ingest mode',
         'order': '9'
     },
     'sampleRate': {
@@ -130,10 +128,10 @@ _DEFAULT_CONFIG = {
         'order': '12'
     },
     'repeatLoop': {
-        'description': 'Read CSV File in an endless loop',
+        'description': 'Read CSV in a loop i.e. on reaching EOF, again go back to beginning of the file',
         'type': 'boolean',
         'default': 'false',
-        'displayName': 'Read from file in a loop?',
+        'displayName': 'Read file in a loop',
         'order': '13'
     },
 }
@@ -177,6 +175,9 @@ def plugin_init(config):
     """
     data = copy.deepcopy(config)
     try:
+        csv_file_name = "{}/{}".format(_FOGLAMP_DATA, data['csvFilename']['value'])
+        if not os.path.isfile(csv_file_name):
+            raise RuntimeError('csv filename "{}" not found'.format(csv_file_name))
         if not data['csvFilename']['value']:
             raise RuntimeError("csv filename cannot be empty")
         if int(data['sampleRate']['value']) < 1 or int(data['sampleRate']['value']) > 1000000:
@@ -299,29 +300,44 @@ class Producer(Thread):
         self.timestamp_interval = None
 
     def get_data(self):
+        has_header = True if self.handle['headerRow']['value'] == 'true' else False
+        field_names = None
+        with open(self.csv_file_name, 'r' ) as data_file:
+            headr = data_file.readline()
+            headr = headr.strip().replace('\n','').replace('\r','').replace(' ','')
+            field_names = headr.split(',') if has_header else \
+                None if self.handle['fieldNames']['value'] == 'None' else self.handle['fieldNames']['value'].split(",")
+
+        # TODO: Improve this and remove above lines
+        # has_header = None
+        # field_names = None
+        # with open(self.csv_file_name, 'r' ) as data_file:
+        #     headr = data_file.readline()
+        #     has_header = csv.Sniffer().has_header(headr)
+        #     headr = headr.strip().replace('\n','').replace('\r','').replace(' ','')
+        #     field_names = self.handle['fieldNames']['value'].split(",") if has_header is None else headr.split(',')
+
         # TODO: Improve this?
         # This will handle timestamp for first row only as there is no prv row to compare timestamp with
         if self.handle['timestampFromFile']['value'] == 'true':
             ts_col = self.handle['timestampCol']['value']
-            if ts_col != 'None':
-                with open(self.csv_file_name, 'r' ) as f:
-                    field_names = self.handle['fieldNames']['value'].split(",") if self.handle['headerRow']['value'] == 'false' else None
-                    reader = csv.DictReader(f, fieldnames=field_names)
-                    line = next(reader)
-                    first_ts = parser.parse(line[ts_col])
-                    line = next(reader)
-                    second_ts = parser.parse(line[ts_col])
-                    self.timestamp_interval = (second_ts - first_ts).total_seconds()
+            ts_format = self.handle['timestampFormat']['value']
+            with open(self.csv_file_name, 'r' ) as f:
+                reader = csv.DictReader(f, fieldnames=field_names)
+                # Skip Header
+                if has_header:
+                    next(reader)
+                line = next(reader)
+                first_ts = datetime.datetime.strptime(line[ts_col], ts_format)
+                line = next(reader)
+                second_ts = datetime.datetime.strptime(line[ts_col], ts_format)
+                self.timestamp_interval = (second_ts - first_ts).total_seconds()
 
         with open(self.csv_file_name, 'r' ) as data_file:
-            # TODO: Audo detect header
-            # headr = data_file.readline()
-            # has_header = csv.Sniffer().has_header(headr)
-            # data_file.seek(0)  # Rewind.
-            # col_labels = None if has_header else field_names
-            # reader = csv.DictReader(data_file, fieldnames=col_labels)
-            field_names = self.handle['fieldNames']['value'].split(",") if self.handle['headerRow']['value'] == 'false' else None
             reader = csv.DictReader(data_file, fieldnames=field_names)
+            # Skip Header
+            if has_header:
+                next(reader)
             for line in reader:
                 yield line
 
@@ -335,17 +351,13 @@ class Producer(Thread):
         ts_col = self.handle['timestampCol']['value']
         ts_format = self.handle['timestampFormat']['value']
         c = 0
-        if ts_col != 'None':
-            if ts_format == 'None':
-                readings_ts = parser.parse(readings[ts_col])
-            else:
-                readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
-            if self.prv_readings_ts is None:
-                c = self.timestamp_interval  # For first row only
-            else:
-                c = readings_ts - self.prv_readings_ts
-                c = c.total_seconds()
-            self.prv_readings_ts = readings_ts
+        readings_ts = datetime.datetime.strptime(readings[ts_col], ts_format)
+        if self.prv_readings_ts is None:
+            c = self.timestamp_interval  # For first row only
+        else:
+            c = readings_ts - self.prv_readings_ts
+            c = c.total_seconds()
+        self.prv_readings_ts = readings_ts
         return c
 
     def run(self):
@@ -389,6 +401,8 @@ class Producer(Thread):
             except StopIteration as ex:
                 _LOGGER.warning("playback - EOF reached: {}".format(str(ex)))
                 eof_reached = True
+            except Exception as ex:
+                _LOGGER.warning("playback producer exception: {}".format(str(ex)))
 
             if not self.condition._is_owned():
                 self.condition.acquire()
