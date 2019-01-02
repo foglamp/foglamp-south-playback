@@ -15,6 +15,7 @@ import json
 import logging
 import datetime
 import time
+import ast
 from threading import Event
 from queue import Queue
 from threading import Thread, Condition
@@ -344,7 +345,12 @@ class Producer(Thread):
             if has_header:
                 next(reader)
             for line in reader:
-                yield line
+                new_line = {}
+                for k, v in line.items():
+                    nv = int(v) if isinstance(ast.literal_eval(v), int) else \
+                        float(v) if isinstance(ast.literal_eval(v), float) else v
+                    new_line.update({k: nv})
+                yield new_line
 
     def get_time_stamp_diff(self, readings):
         # The option to have the timestamp come from a column in the CSV file. The first timestamp should
