@@ -346,7 +346,7 @@ class Producer(Thread):
             if has_header:
                 next(reader)
             regex = re.compile(
-                '[ `~!@#$%^&*()_=+-}{\]\[|;:"<>,.?/\\\'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]')
+                '[ `~!@#$%^&*()_=+}{\]\[|;:"<>,?/\\\'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]')
             for line in reader:
                 new_line = {}
                 for k, v in line.items():
