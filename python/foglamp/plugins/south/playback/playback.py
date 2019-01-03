@@ -99,7 +99,7 @@ _DEFAULT_CONFIG = {
     'ingestMode': {
         'description': 'Mode of data ingest - burst/batch',
         'type': 'enumeration',
-        'default': 'burst',
+        'default': 'batch',
         'options': ['batch', 'burst'],
         'displayName': 'Ingest mode',
         'order': '9'
