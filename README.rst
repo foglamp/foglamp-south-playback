@@ -22,6 +22,7 @@ Configuration options explained
     - 'burstSize': No. of readings sets in one burst.
     - 'repeatLoop': If file is small, then we may want to read it in a loop.
 
+``NOTE: CSV string data with single quote (') and double quotes(") are not supported.``
 
 ***********************
 Packaging for playback

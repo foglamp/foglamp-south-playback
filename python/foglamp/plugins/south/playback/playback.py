@@ -15,6 +15,8 @@ import json
 import logging
 import datetime
 import time
+import ast
+import re
 from threading import Event
 from queue import Queue
 from threading import Thread, Condition
@@ -48,7 +50,7 @@ _DEFAULT_CONFIG = {
     'csvFilename': {
         'description': 'CSV File name',
         'type': 'string',
-        'default': 'sinusoid.csv',
+        'default': 'some.csv',
         'displayName': 'CSV file name with extension',
         'order': '2'
     },
@@ -97,8 +99,8 @@ _DEFAULT_CONFIG = {
     'ingestMode': {
         'description': 'Mode of data ingest - burst/batch',
         'type': 'enumeration',
-        'default': 'burst',
-        'options': ['burst', 'batch'],
+        'default': 'batch',
+        'options': ['batch', 'burst'],
         'displayName': 'Ingest mode',
         'order': '9'
     },
@@ -343,8 +345,21 @@ class Producer(Thread):
             # Skip Header
             if has_header:
                 next(reader)
+            regex = re.compile(
+                '[ `~!@#$%^&*()_=+}{\]\[|;:"<>,?/\\\'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]')
             for line in reader:
-                yield line
+                new_line = {}
+                for k, v in line.items():
+                    try:
+                        if regex.search(v) is not None:
+                            nv = v
+                        else:
+                            nv = int(v) if isinstance(ast.literal_eval(v), int) else \
+                                float(v) if isinstance(ast.literal_eval(v), float) else v
+                    except ValueError:
+                        nv = v
+                    new_line.update({k: nv})
+                yield new_line
 
     def get_time_stamp_diff(self, readings):
         # The option to have the timestamp come from a column in the CSV file. The first timestamp should
