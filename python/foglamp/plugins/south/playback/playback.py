@@ -24,7 +24,7 @@ from threading import Thread, Condition
 from foglamp.common import logger
 from foglamp.plugins.common import utils
 from foglamp.services.south import exceptions
-from foglamp.services.south.ingest import Ingest
+import async_ingest
 
 
 __author__ = "Amarendra Kumar Sinha"
@@ -69,7 +69,7 @@ _DEFAULT_CONFIG = {
         'order': '4'
     },
     'readingCols': {
-        'description': 'Cherry pick data columns with the same/new name e.g. {"readings": "readings", "ts": "timestamp"}',
+        'description': 'Cherry pick data columns with the same/new name',
         'type': 'JSON',
         'default': '{}',
         'displayName': 'Cherry pick column with same/new name',
@@ -147,6 +147,8 @@ bucket = None
 condition = None
 BUCKET_SIZE = 1
 wait_event = Event()
+c_callback = None
+c_ingest_ref = None
 
 
 def plugin_info():
@@ -158,7 +160,7 @@ def plugin_info():
     """
     return {
         'name': 'Playback',
-        'version': '1.0',
+        'version': '1.5.0',
         'mode': 'async',
         'type': 'south',
         'interface': '1.0',
@@ -219,17 +221,15 @@ def plugin_start(handle):
     if handle['timestampFromFile']['value'] == 'false':
         BUCKET_SIZE = int(handle['sampleRate']['value'])
 
-    loop = asyncio.get_event_loop()
     condition = Condition()
     bucket = Queue(BUCKET_SIZE)
-    producer = Producer(bucket, condition, handle, loop)
-    consumer = Consumer(bucket, condition, handle, loop)
+    producer = Producer(bucket, condition, handle)
+    consumer = Consumer(bucket, condition, handle)
 
     wait_event.clear()
 
     producer.start()
     consumer.start()
-    bucket.join()
 
 
 def plugin_reconfigure(handle, new_config):
@@ -242,21 +242,16 @@ def plugin_reconfigure(handle, new_config):
         new_handle: new handle to be used in the future calls
     """
     _LOGGER.info("Old config for playback plugin {} \n new config {}".format(handle, new_config))
-    # Find diff between old config and new config
-    diff = utils.get_diff(handle, new_config)
-    # Plugin should re-initialize and restart if key configuration is changed
-    if 'assetName' in diff or 'csvFilename' in diff or 'headerRow' in diff or \
-        'fieldNames' in diff or 'readingCols' in diff or 'timestampFromFile' in diff or \
-        'timestampCol' in diff or 'timestampFormat' in diff or \
-        'sampleRate' in diff or 'ingestMode' in diff or 'burstSize' in diff or 'burstInterval' in diff or \
-        'repeatLoop' in diff:
-        plugin_shutdown(handle)
-        new_handle = plugin_init(new_config)
-        new_handle['restart'] = 'yes'
-        _LOGGER.info("Restarting playback plugin due to change in configuration key [{}]".format(', '.join(diff)))
-    else:
-        new_handle = copy.deepcopy(new_config)
-        new_handle['restart'] = 'no'
+
+    # plugin_shutdown
+    plugin_shutdown(handle)
+
+    # plugin_init
+    new_handle = plugin_init(new_config)
+
+    # plugin_start
+    plugin_start(new_handle)
+
     return new_handle
 
 
@@ -268,7 +263,7 @@ def plugin_shutdown(handle):
     Returns:
         plugin shutdown
     """
-    global producer, consumer, wait_event
+    global producer, consumer, wait_event, bucket, condition
 
     wait_event.set()
     if producer is not None:
@@ -279,16 +274,32 @@ def plugin_shutdown(handle):
         consumer._tstate_lock = None
         consumer._stop()
         consumer = None
+    if bucket is not None:
+        bucket.unfinished_tasks = 0
+        bucket = None
+    condition = None
     _LOGGER.info('playback plugin shut down.')
 
 
+def plugin_register_ingest(handle, callback, ingest_ref):
+    """Required plugin interface component to communicate to South C server
+
+    Args:
+        handle: handle returned by the plugin initialisation call
+        callback: C opaque object required to passed back to C->ingest method
+        ingest_ref: C opaque object required to passed back to C->ingest method
+    """
+    global c_callback, c_ingest_ref
+    c_callback = callback
+    c_ingest_ref = ingest_ref
+
+
 class Producer(Thread):
-    def __init__(self, queue, condition, handle, loop):
+    def __init__(self, queue, condition, handle):
         super(Producer, self).__init__()
         self.queue = queue
         self.condition = condition
         self.handle = handle
-        self.loop = loop
 
         try:
             if self.handle['ingestMode']['value'] == 'burst':
@@ -305,7 +316,8 @@ class Producer(Thread):
         self.iter_sensor_data = iter(self.get_data())
 
         # Cherry pick columns from readings and if desired, with
-        self.reading_cols = json.loads(self.handle['readingCols']['value'])
+        rc = self.handle['readingCols']['value']
+        self.reading_cols = rc if isinstance(rc, dict) else json.loads(rc)
 
         self.prv_readings_ts = None
         self.timestamp_interval = None
@@ -340,22 +352,31 @@ class Producer(Thread):
                     if ts_col != i: new_reading_cols.update({i:i})
             self.reading_cols = new_reading_cols.copy()
 
-        with open(self.csv_file_name, 'r' ) as data_file:
+        with open(self.csv_file_name, 'r') as data_file:
             reader = csv.DictReader(data_file, fieldnames=field_names)
             # Skip Header
             if has_header:
                 next(reader)
             regex = re.compile(
-                '[ `~!@#$%^&*()_=+}{\]\[|;:"<>,?/\\\'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]')
+                '[ `~!@#$%^&*()_=}{\]\[|;:"<>,?/\\\'ABCDFGHIJKLMNOPQRSTUVWXYZabcdfghijklmnopqrstuvwxyz]')
+            regex_num = re.compile('[+-0123456789]')
+            regex_float = re.compile('[.eE]')
             for line in reader:
                 new_line = {}
                 for k, v in line.items():
                     try:
-                        if regex.search(v) is not None:
+                        contains_numbers = regex_num.search(v) is not None
+                        contains_float = regex_float.search(v) is not None
+                        contains_string = regex.search(v) is not None
+                        if contains_string:
                             nv = v
+                        elif contains_numbers:
+                            if contains_float:
+                                nv = float(v) if isinstance(ast.literal_eval(v), float) else v
+                            else:
+                                nv = int(v) if isinstance(ast.literal_eval(v), int) else v
                         else:
-                            nv = int(v) if isinstance(ast.literal_eval(v), int) else \
-                                float(v) if isinstance(ast.literal_eval(v), float) else v
+                            nv = v
                     except ValueError:
                         nv = v
                     new_line.update({k: nv})
@@ -451,38 +472,28 @@ class Producer(Thread):
 
 
 class Consumer(Thread):
-    def __init__(self, queue, condition, handle, loop):
+    def __init__(self, queue, condition, handle):
         super(Consumer, self).__init__()
         self.queue = queue
         self.condition = condition
         self.handle = handle
-        self.loop = loop
 
     def run(self):
-        asyncio.set_event_loop(loop=self.loop)
+        global wait_event
         while True:
+            if wait_event.is_set():  # i.e. shutdown called
+                return
             self.condition.acquire()
             while self.queue.qsize() > 0:
                 data = self.queue.get()
-                asyncio.ensure_future(self.save_data(data['data'], data['ts']), loop=self.loop)
+                reading = data['data']
+                time_stamp = data['ts']
+                reading = {
+                    'asset': self.handle['assetName']['value'],
+                    'timestamp': time_stamp,
+                    'key': str(uuid.uuid4()),
+                    'readings': reading
+                }
+                async_ingest.ingest_callback(c_callback, c_ingest_ref, reading)
             self.condition.notify()
             self.condition.release()
-
-    async def save_data(self, sensor_data, time_stamp):
-        try:
-            data = {
-                'asset': self.handle['assetName']['value'],
-                'timestamp': time_stamp,
-                'key': str(uuid.uuid4()),
-                'readings': sensor_data
-            }
-            await Ingest.add_readings(asset='{}'.format(data['asset']),
-                                      timestamp=data['timestamp'], key=data['key'],
-                                      readings=data['readings'])
-        except (asyncio.CancelledError, RuntimeError):
-            pass
-        except RuntimeWarning as ex:
-            _LOGGER.exception("playback warning: {}".format(str(ex)))
-        except Exception as ex:
-            _LOGGER.exception("playback exception: {}".format(str(ex)))
-            raise exceptions.DataRetrievalError(ex)
