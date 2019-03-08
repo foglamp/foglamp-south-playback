@@ -465,6 +465,7 @@ class Producer(Thread):
             if eof_reached:
                 # Rewind CSV file if it is to be read in an infinite loop
                 if self.handle['repeatLoop']['value'] == 'true':
+                    # repeatLoop should not continue if thread has been signalled to stop
                     if self._tstate_lock is None:
                         return
                     self.iter_sensor_data = iter(self.get_data())
