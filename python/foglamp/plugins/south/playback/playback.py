@@ -6,7 +6,6 @@
 
 """ Module for playback async plugin """
 
-import asyncio
 import copy
 import csv
 import uuid
@@ -23,15 +22,13 @@ from threading import Thread, Condition
 
 from foglamp.common import logger
 from foglamp.plugins.common import utils
-from foglamp.services.south import exceptions
-import async_ingest
 
+import async_ingest
 
 __author__ = "Amarendra Kumar Sinha"
 __copyright__ = "Copyright (c) 2018 Dianomic Systems"
 __license__ = "Apache 2.0"
 __version__ = "${VERSION}"
-
 
 _DEFAULT_CONFIG = {
     'plugin': {
@@ -76,10 +73,10 @@ _DEFAULT_CONFIG = {
         'order': '5'
     },
     'timestampFromFile': {
-        'description': 'Time Delta to be choosen from a column in the CSV',
+        'description': 'Time Delta to be chosen from a column in the CSV',
         'type': 'boolean',
         'default': 'false',
-        'displayName': 'Time stamp from file?',
+        'displayName': 'Timestamp delta from file?',
         'order': '6'
     },
     'timestampCol': {
@@ -141,6 +138,7 @@ _DEFAULT_CONFIG = {
 _FOGLAMP_ROOT = os.getenv("FOGLAMP_ROOT", default='/usr/local/foglamp')
 _FOGLAMP_DATA = os.path.expanduser(_FOGLAMP_ROOT + '/data')
 _LOGGER = logger.setup(__name__, level=logging.INFO)
+
 producer = None
 consumer = None
 bucket = None
@@ -149,6 +147,7 @@ BUCKET_SIZE = 1
 wait_event = Event()
 c_callback = None
 c_ingest_ref = None
+data_file = None
 
 
 def plugin_info():
@@ -220,6 +219,12 @@ def plugin_start(handle):
 
     if handle['timestampFromFile']['value'] == 'false':
         BUCKET_SIZE = int(handle['sampleRate']['value'])
+
+    csv_file_name = "{}/{}".format(_FOGLAMP_DATA, handle['csvFilename']['value'])
+
+    with open(csv_file_name, 'r') as d:
+        global data_file
+        data_file = d.read()
 
     condition = Condition()
     bucket = Queue(BUCKET_SIZE)
@@ -312,7 +317,6 @@ class Producer(Thread):
             _LOGGER.warning('sampleRate must be greater than 0, defaulting to 1')
             self.period = 1.0
 
-        self.csv_file_name = "{}/{}".format(_FOGLAMP_DATA, self.handle['csvFilename']['value'])
         self.iter_sensor_data = iter(self.get_data())
 
         # Cherry pick columns from readings and if desired, with
@@ -324,21 +328,13 @@ class Producer(Thread):
 
     def get_data(self):
         has_header = True if self.handle['headerRow']['value'] == 'true' else False
-        field_names = None
-        with open(self.csv_file_name, 'r' ) as data_file:
-            headr = data_file.readline()
-            headr = headr.strip().replace('\n','').replace('\r','').replace(' ','')
-            field_names = headr.split(',') if has_header else \
-                None if self.handle['fieldNames']['value'] == 'None' else self.handle['fieldNames']['value'].split(",")
 
-        # TODO: Improve this and remove above lines
-        # has_header = None
-        # field_names = None
-        # with open(self.csv_file_name, 'r' ) as data_file:
-        #     headr = data_file.readline()
-        #     has_header = csv.Sniffer().has_header(headr)
-        #     headr = headr.strip().replace('\n','').replace('\r','').replace(' ','')
-        #     field_names = self.handle['fieldNames']['value'].split(",") if has_header is None else headr.split(',')
+        global data_file
+
+        headr = data_file
+        headr = headr.strip().replace('\n', '').replace('\r', '').replace(' ', '')
+        field_names = headr.split(',') if has_header else \
+            None if self.handle['fieldNames']['value'] == 'None' else self.handle['fieldNames']['value'].split(",")
 
         # Exclude timestampCol from reading_cols
         if self.handle['timestampFromFile']['value'] == 'true':
@@ -346,41 +342,41 @@ class Producer(Thread):
             new_reading_cols = self.reading_cols.copy()
             if len(self.reading_cols) > 0:
                 for k, v in self.reading_cols.items():
-                    if ts_col != k: new_reading_cols.update({k: v})
+                    if ts_col != k:
+                        new_reading_cols.update({k: v})
             else:
                 for i in field_names:
-                    if ts_col != i: new_reading_cols.update({i:i})
+                    if ts_col != i:
+                        new_reading_cols.update({i: i})
             self.reading_cols = new_reading_cols.copy()
 
-        with open(self.csv_file_name, 'r') as data_file:
-            reader = csv.DictReader(data_file, fieldnames=field_names)
-            # Skip Header
-            if has_header:
-                next(reader)
-            regex = re.compile(
-                '[ `~!@#$%^&*()_=}{\]\[|;:"<>,?/\\\'ABCDFGHIJKLMNOPQRSTUVWXYZabcdfghijklmnopqrstuvwxyz]')
-            regex_num = re.compile('[+-0123456789]')
-            regex_float = re.compile('[.eE]')
-            for line in reader:
-                new_line = {}
-                for k, v in line.items():
-                    try:
-                        contains_numbers = regex_num.search(v) is not None
-                        contains_float = regex_float.search(v) is not None
-                        contains_string = regex.search(v) is not None
-                        if contains_string:
-                            nv = v
-                        elif contains_numbers:
-                            if contains_float:
-                                nv = float(v) if isinstance(ast.literal_eval(v), float) else v
-                            else:
-                                nv = int(v) if isinstance(ast.literal_eval(v), int) else v
-                        else:
-                            nv = v
-                    except ValueError:
+        reader = csv.DictReader(data_file, fieldnames=field_names)
+        # Skip Header
+        if has_header:
+            next(reader)
+        regex = re.compile('[ `~!@#$%^&*()_=}{\]\[|;:"<>,?/\\\'ABCDFGHIJKLMNOPQRSTUVWXYZabcdfghijklmnopqrstuvwxyz]')
+        regex_num = re.compile('[+-0123456789]')
+        regex_float = re.compile('[.eE]')
+        for line in reader:
+            new_line = {}
+            for k, v in line.items():
+                try:
+                    contains_numbers = regex_num.search(v) is not None
+                    contains_float = regex_float.search(v) is not None
+                    contains_string = regex.search(v) is not None
+                    if contains_string:
                         nv = v
-                    new_line.update({k: nv})
-                yield new_line
+                    elif contains_numbers:
+                        if contains_float:
+                            nv = float(v) if isinstance(ast.literal_eval(v), float) else v
+                        else:
+                            nv = int(v) if isinstance(ast.literal_eval(v), int) else v
+                    else:
+                        nv = v
+                except ValueError:
+                    nv = v
+                new_line.update({k: nv})
+            yield new_line
 
     def get_time_stamp_diff(self, readings):
         # The option to have the timestamp come from a column in the CSV file. The first timestamp should
@@ -406,7 +402,6 @@ class Producer(Thread):
         eof_reached = False
         while True:
             time_start = time.time()
-            time_stamp = None
             sensor_data = {}
             try:
                 if self.handle['ingestMode']['value'] == 'burst':
@@ -450,12 +445,11 @@ class Producer(Thread):
             except Exception as ex:
                 _LOGGER.warning("playback producer exception: {}".format(str(ex)))
 
-            wait_event.wait(timeout=next_iteration_secs - (time.time()-time_start))
             time_stamp = utils.local_timestamp()
 
             if not self.condition._is_owned():
                 self.condition.acquire()
-            if len(sensor_data) > 0 :
+            if len(sensor_data) > 0:
                 value = {'data': sensor_data, 'ts': time_stamp}
                 self.queue.put(value)
             if self.queue.full() or eof_reached:
@@ -472,13 +466,15 @@ class Producer(Thread):
                     eof_reached = False
                 else:
                     return
+            else:
+                wait_event.wait(timeout=next_iteration_secs - (time.time() - time_start))
 
 
 class Consumer(Thread):
-    def __init__(self, queue, condition, handle):
+    def __init__(self, queue, cond, handle):
         super(Consumer, self).__init__()
         self.queue = queue
-        self.condition = condition
+        self.condition = cond
         self.handle = handle
 
     def run(self):
@@ -497,6 +493,8 @@ class Consumer(Thread):
                     'key': str(uuid.uuid4()),
                     'readings': reading
                 }
+                _LOGGER.warning(time.time())
                 async_ingest.ingest_callback(c_callback, c_ingest_ref, reading)
+                _LOGGER.warning(time.time())
             self.condition.notify()
             self.condition.release()
