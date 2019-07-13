@@ -493,8 +493,6 @@ class Consumer(Thread):
                     'key': str(uuid.uuid4()),
                     'readings': reading
                 }
-                _LOGGER.warning(time.time())
                 async_ingest.ingest_callback(c_callback, c_ingest_ref, reading)
-                _LOGGER.warning(time.time())
             self.condition.notify()
             self.condition.release()
