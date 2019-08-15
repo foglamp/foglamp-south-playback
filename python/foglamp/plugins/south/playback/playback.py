@@ -76,25 +76,32 @@ _DEFAULT_CONFIG = {
         'order': '5'
     },
     'timestampFromFile': {
-        'description': 'Time Delta to be choosen from a column in the CSV',
+        'description': 'Time Delta to be chosen from a column in the CSV',
         'type': 'boolean',
         'default': 'false',
-        'displayName': 'Time stamp from file?',
+        'displayName': 'Pick timestamp from file',
         'order': '6'
+    },
+    'historicTimestamps': {
+        'description': 'Use original timestamps rather than ingest in real time',
+        'type': 'boolean',
+        'default': 'false',
+        'displayName': 'Historic timestamps',
+        'order': '7'
     },
     'timestampCol': {
         'description': 'Timestamp header column, mandatory if timestampFromFile is true',
         'type': 'string',
         'default': 'ts',
         'displayName': 'Timestamp column name',
-        'order': '7'
+        'order': '8'
     },
     'timestampFormat': {
         'description': 'Timestamp format in File, mandatory if timestampFromFile is true',
         'type': 'string',
         'default': '%Y-%m-%d %H:%M:%S.%f',
         'displayName': 'Timestamp format',
-        'order': '8'
+        'order': '9'
     },
     'ingestMode': {
         'description': 'Mode of data ingest - burst/batch',
@@ -102,7 +109,7 @@ _DEFAULT_CONFIG = {
         'default': 'batch',
         'options': ['batch', 'burst'],
         'displayName': 'Ingest mode',
-        'order': '9'
+        'order': '10'
     },
     'sampleRate': {
         'description': 'No. of readings per sec',
@@ -111,7 +118,7 @@ _DEFAULT_CONFIG = {
         'displayName': 'Sample Rate',
         'minimum': '1',
         'maximum': '1000000',
-        'order': '10'
+        'order': '11'
     },
     'burstInterval': {
         'description': 'Time interval between consecutive bursts in milliseconds',
@@ -119,7 +126,7 @@ _DEFAULT_CONFIG = {
         'default': '1000',
         'displayName': 'Burst Interval (ms)',
         'minimum': '1',
-        'order': '11'
+        'order': '12'
     },
     'burstSize': {
         'description': 'No. of data points in one burst',
@@ -127,14 +134,14 @@ _DEFAULT_CONFIG = {
         'default': '1',
         'displayName': 'Burst size',
         'minimum': '1',
-        'order': '12'
+        'order': '13'
     },
     'repeatLoop': {
         'description': 'Read CSV in a loop i.e. on reaching EOF, again go back to beginning of the file',
         'type': 'boolean',
         'default': 'false',
         'displayName': 'Read file in a loop',
-        'order': '13'
+        'order': '14'
     },
 }
 
@@ -341,16 +348,17 @@ class Producer(Thread):
         #     field_names = self.handle['fieldNames']['value'].split(",") if has_header is None else headr.split(',')
 
         # Exclude timestampCol from reading_cols
-        if self.handle['timestampFromFile']['value'] == 'true':
-            ts_col = self.handle['timestampCol']['value']
-            new_reading_cols = self.reading_cols.copy()
-            if len(self.reading_cols) > 0:
-                for k, v in self.reading_cols.items():
-                    if ts_col != k: new_reading_cols.update({k: v})
-            else:
-                for i in field_names:
-                    if ts_col != i: new_reading_cols.update({i:i})
-            self.reading_cols = new_reading_cols.copy()
+        if self.handle['historicTimestamps']['value'] == 'false':
+            if self.handle['timestampFromFile']['value'] == 'true':
+                ts_col = self.handle['timestampCol']['value']
+                new_reading_cols = self.reading_cols.copy()
+                if len(self.reading_cols) > 0:
+                    for k, v in self.reading_cols.items():
+                        if ts_col != k: new_reading_cols.update({k: v})
+                else:
+                    for i in field_names:
+                        if ts_col != i: new_reading_cols.update({i:i})
+                self.reading_cols = new_reading_cols.copy()
 
         with open(self.csv_file_name, 'r') as data_file:
             reader = csv.DictReader(data_file, fieldnames=field_names)
@@ -437,7 +445,9 @@ class Producer(Thread):
                                 sensor_data.update({v: readings[k]})
                     else:
                         sensor_data.update(readings)
-                    if self.handle['timestampFromFile']['value'] == 'true':
+                    if self.handle['historicTimestamps']['value'] == 'true':
+                        next_iteration_secs = self.period
+                    elif self.handle['timestampFromFile']['value'] == 'true':
                         next_iteration_secs = self.get_time_stamp_diff(readings)
                     else:
                         next_iteration_secs = self.period
@@ -490,7 +500,15 @@ class Consumer(Thread):
             while self.queue.qsize() > 0:
                 data = self.queue.get()
                 reading = data['data']
-                time_stamp = data['ts']
+                
+                if self.handle['historicTimestamps']['value'] == 'true':
+                    ts_col = self.handle['timestampCol']['value']
+                    raw_time_stamp = reading.pop(ts_col)
+                    ts_format = self.handle['timestampFormat']['value']
+                    time_stamp = str(datetime.datetime.strptime(raw_time_stamp, ts_format))
+                else:
+                    time_stamp = data['ts']
+
                 reading = {
                     'asset': self.handle['assetName']['value'],
                     'timestamp': time_stamp,
