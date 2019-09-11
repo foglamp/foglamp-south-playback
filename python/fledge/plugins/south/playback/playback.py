@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 
-# FOGLAMP_BEGIN
-# See: http://foglamp.readthedocs.io/
-# FOGLAMP_END
+# FLEDGE_BEGIN
+# See: http://fledge.readthedocs.io/
+# FLEDGE_END
 
 """ Module for playback async plugin """
 
@@ -21,9 +21,9 @@ from threading import Event
 from queue import Queue
 from threading import Thread, Condition
 
-from foglamp.common import logger
-from foglamp.plugins.common import utils
-from foglamp.services.south import exceptions
+from fledge.common import logger
+from fledge.plugins.common import utils
+from fledge.services.south import exceptions
 import async_ingest
 
 
@@ -145,8 +145,8 @@ _DEFAULT_CONFIG = {
     },
 }
 
-_FOGLAMP_ROOT = os.getenv("FOGLAMP_ROOT", default='/usr/local/foglamp')
-_FOGLAMP_DATA = os.path.expanduser(_FOGLAMP_ROOT + '/data')
+_FLEDGE_ROOT = os.getenv("FLEDGE_ROOT", default='/usr/local/fledge')
+_FLEDGE_DATA = os.path.expanduser(_FLEDGE_ROOT + '/data')
 _LOGGER = logger.setup(__name__, level=logging.INFO)
 producer = None
 consumer = None
@@ -186,7 +186,7 @@ def plugin_init(config):
     data = copy.deepcopy(config)
     try:
         errors = False
-        csv_file_name = "{}/{}".format(_FOGLAMP_DATA, data['csvFilename']['value'])
+        csv_file_name = "{}/{}".format(_FLEDGE_DATA, data['csvFilename']['value'])
         if not os.path.isfile(csv_file_name):
             _LOGGER.exception('csv filename "{}" not found'.format(csv_file_name))
             errors = True
@@ -319,7 +319,7 @@ class Producer(Thread):
             _LOGGER.warning('sampleRate must be greater than 0, defaulting to 1')
             self.period = 1.0
 
-        self.csv_file_name = "{}/{}".format(_FOGLAMP_DATA, self.handle['csvFilename']['value'])
+        self.csv_file_name = "{}/{}".format(_FLEDGE_DATA, self.handle['csvFilename']['value'])
         self.iter_sensor_data = iter(self.get_data())
 
         # Cherry pick columns from readings and if desired, with
