@@ -77,15 +77,15 @@ _DEFAULT_CONFIG = {
         'description': 'Time Delta to be chosen from a column in the CSV',
         'type': 'boolean',
         'default': 'false',
-        'displayName': 'Pick timestamp from file',
-        'order': '6'
+        'displayName': 'Pick timestamp delta from file',
+        'order': '7'
     },
     'historicTimestamps': {
         'description': 'Use original timestamps rather than ingest in real time',
         'type': 'boolean',
         'default': 'false',
         'displayName': 'Historic timestamps',
-        'order': '7'
+        'order': '6'
     },
     'timestampCol': {
         'description': 'Timestamp header column, mandatory if timestampFromFile is true',
@@ -248,13 +248,9 @@ def plugin_reconfigure(handle, new_config):
     """
     _LOGGER.info("Old config for playback plugin {} \n new config {}".format(handle, new_config))
 
-    # plugin_shutdown
     plugin_shutdown(handle)
 
-    # plugin_init
     new_handle = plugin_init(new_config)
-
-    # plugin_start
     plugin_start(new_handle)
 
     return new_handle
@@ -453,7 +449,7 @@ class Producer(Thread):
 
             if not self.condition._is_owned():
                 self.condition.acquire()
-            if len(sensor_data) > 0 :
+            if len(sensor_data) > 0:
                 value = {'data': sensor_data, 'ts': time_stamp}
                 self.queue.put(value)
             if self.queue.full() or eof_reached:
